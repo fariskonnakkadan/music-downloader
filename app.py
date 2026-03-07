@@ -1,140 +1,236 @@
 import os
 import zipfile
 import tempfile
+import shutil
+import time
 from flask import Flask, request, send_file, render_template_string
+from flask_socketio import SocketIO, emit
 from yt_dlp import YoutubeDL
 from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
-app.secret_key = "your_secret_key"
+app.config['SECRET_KEY'] = 'dev_key_123'
+# Using 'threading' mode to avoid the NotImplementedError on macOS/LibreSSL
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
-# Search YouTube using yt-dlp
-def search_youtube(video_name):
+# Store paths to clean up later
+TEMP_STAGING = {}
+
+def update_status(msg, status_type="info"):
+    """Sends real-time updates to the frontend."""
+    socketio.emit('status_update', {'msg': msg, 'type': status_type})
+
+def download_item(name, download_dir, video_format):
     try:
-        ydl_opts = {
-            'quiet': True,
-            'default_search': 'ytsearch',
-            'noplaylist': True,
-            'skip_download': True,
+        update_status(f"🔍 Searching: {name}...")
+        
+        # 1. Search Logic
+        search_opts = {
+            'quiet': True, 
+            'default_search': 'ytsearch', 
+            'noplaylist': True, 
+            'skip_download': True
         }
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_name, download=False)
-            if 'entries' in info and info['entries']:
-                first = info['entries'][0]
-                return first['webpage_url'], first['title']
-        return None, None
-    except Exception as e:
-        print(f"Error searching for {video_name}: {e}")
-        return None, None
+        with YoutubeDL(search_opts) as ydl:
+            info = ydl.extract_info(name, download=False)
+            if not info or 'entries' not in info or not info['entries']:
+                update_status(f"⚠️ Could not find: {name}", "error")
+                return None
+            video = info['entries'][0]
+            url = video['webpage_url']
+            title = video.get('title', 'Unknown Video')
 
-# Download video/audio using yt-dlp
-def download_video(url, output_path, format="mp3"):
-    if format == "mp3":
+        update_status(f"📥 Downloading: {title[:50]}...")
+
+        # 2. Download Logic
         ydl_opts = {
-            'format': 'bestaudio/best',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-            'outtmpl': os.path.join(output_path, '%(title)s.%(ext)s'),
-            'quiet': True,
-            'no_warnings': True,
-        }
-    else:
-        ydl_opts = {
-            'format': 'bestvideo+bestaudio/best',
-            'outtmpl': os.path.join(output_path, '%(title)s.%(ext)s'),
+            'outtmpl': os.path.join(download_dir, '%(title)s.%(ext)s'),
             'quiet': True,
             'no_warnings': True,
         }
 
-    try:
+        if video_format == "mp3":
+            ydl_opts.update({
+                'format': 'bestaudio/best',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192'
+                }],
+            })
+        else:
+            ydl_opts['format'] = 'bestvideo+bestaudio/best'
+
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
+        
+        update_status(f"✅ Completed: {title[:40]}...", "success")
+        return title
+
     except Exception as e:
-        print(f"Error downloading {url}: {e}")
+        update_status(f"❌ Error processing '{name}': {str(e)}", "error")
+        return None
 
-@app.route("/", methods=["GET", "POST"])
+@app.route("/")
 def index():
-    if request.method == "POST":
-        video_names = request.form.get("video_list").strip().split("\n")
-        format = request.form.get("format")
-        threads = int(request.form.get("threads", 1))
+    return render_template_string(HTML_TEMPLATE)
 
-        # Temporary directory for downloads
-        temp_dir = tempfile.mkdtemp()
-        download_dir = os.path.join(temp_dir, "downloads")
-        os.makedirs(download_dir, exist_ok=True)
+@socketio.on('start_download')
+def handle_download(data):
+    video_names = [v.strip() for v in data['video_list'].split('\n') if v.strip()]
+    video_format = data['format']
+    threads = int(data['threads'])
 
-        # Download each video
-        def process_video(name):
-            url, title = search_youtube(name)
-            if url:
-                download_video(url, download_dir, format=format)
-                return title
-            return None
+    # Create isolated temp environment
+    base_temp = tempfile.mkdtemp()
+    download_dir = os.path.join(base_temp, "downloads")
+    os.makedirs(download_dir, exist_ok=True)
 
-        with ThreadPoolExecutor(max_workers=threads) as executor:
-            executor.map(process_video, video_names)
+    update_status(f"🚀 Batch started ({len(video_names)} items, {threads} threads)")
 
-        # Create a ZIP file
-        zip_path = os.path.join(temp_dir, "downloads.zip")
-        with zipfile.ZipFile(zip_path, "w") as zipf:
-            for root, _, files in os.walk(download_dir):
-                for file in files:
-                    zipf.write(os.path.join(root, file), file)
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        # We use list() to block until all threads in this batch are done
+        list(executor.map(lambda name: download_item(name, download_dir, video_format), video_names))
 
-        return send_file(zip_path, as_attachment=True, download_name="downloads.zip")
+    update_status("📦 Creating ZIP archive...")
+    zip_filename = f"batch_{int(time.time())}.zip"
+    zip_path = os.path.join(base_temp, zip_filename)
+    
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        for root, _, files in os.walk(download_dir):
+            for file in files:
+                zipf.write(os.path.join(root, file), file)
 
-    return render_template_string("""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>YouTube Downloader</title>
-        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/css/bootstrap.min.css">
-    </head>
-    <body>
-    <div class="container my-5">
-        <h1 class="text-center mb-4">YouTube Downloader</h1>
-        <form method="POST">
-            <div class="mb-3">
-                <label for="video_list" class="form-label">Video List</label>
-                <textarea class="form-control" id="video_list" name="video_list" rows="5" placeholder="Enter one video name per line" required></textarea>
-            </div>
-            <div class="mb-3">
-                <label class="form-label">Download Format</label>
+    # Clean up the raw downloads folder to save space, keep the ZIP
+    shutil.rmtree(download_dir)
+    
+    sid = request.sid
+    TEMP_STAGING[sid] = zip_path
+    
+    update_status("✨ All tasks finished!", "success")
+    emit('download_ready', {'url': f'/fetch/{sid}'})
+
+@app.route("/fetch/<sid>")
+def fetch_zip(sid):
+    file_path = TEMP_STAGING.get(sid)
+    if file_path and os.path.exists(file_path):
+        return send_file(file_path, as_attachment=True)
+    return "Link expired or file not found.", 404
+
+# --- MODERN UI TEMPLATE ---
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Streamloader UI</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
+    <style>
+        body { background: #020617; color: #f8fafc; font-family: 'Inter', sans-serif; }
+        .glass { background: rgba(15, 23, 42, 0.8); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.1); }
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #334155; border-radius: 10px; }
+    </style>
+</head>
+<body class="min-h-screen flex items-center justify-center p-6">
+    <div class="max-w-3xl w-full glass rounded-3xl p-8 shadow-2xl border border-white/5">
+        <header class="mb-8">
+            <h1 class="text-4xl font-black tracking-tight bg-gradient-to-br from-blue-400 to-indigo-600 bg-clip-text text-transparent">
+                Streamloader <span class="text-white/20 font-light">v2.0</span>
+            </h1>
+            <p class="text-slate-400 mt-2">Professional YouTube batch downloader with real-time logging.</p>
+        </header>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div class="md:col-span-2 space-y-5">
                 <div>
-                    <div class="form-check form-check-inline">
-                        <input class="form-check-input" type="radio" name="format" id="mp3" value="mp3" checked>
-                        <label class="form-check-label" for="mp3">MP3</label>
+                    <label class="block text-xs font-bold uppercase tracking-wider text-slate-500 mb-2">Video Queue</label>
+                    <textarea id="video_list" rows="6" 
+                        class="w-full bg-slate-950/50 border border-slate-800 rounded-2xl p-4 focus:ring-2 focus:ring-blue-500/50 outline-none transition-all placeholder:text-slate-700" 
+                        placeholder="Paste URLs or video titles here..."></textarea>
+                </div>
+                
+                <div class="flex gap-4">
+                    <div class="flex-1">
+                        <label class="block text-xs font-bold text-slate-500 mb-2">Format</label>
+                        <select id="format" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 outline-none focus:border-blue-500">
+                            <option value="mp3">Audio (MP3)</option>
+                            <option value="mp4">Video (MP4)</option>
+                        </select>
                     </div>
-                    <div class="form-check form-check-inline">
-                        <input class="form-check-input" type="radio" name="format" id="mp4" value="mp4">
-                        <label class="form-check-label" for="mp4">MP4</label>
+                    <div class="flex-1">
+                        <label class="block text-xs font-bold text-slate-500 mb-2">Threads</label>
+                        <select id="threads" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 outline-none focus:border-blue-500">
+                            <option value="1">Single</option>
+                            <option value="4" selected>4 Threads</option>
+                            <option value="8">8 Threads</option>
+                        </select>
                     </div>
                 </div>
+
+                <button onclick="startDownload()" id="main_btn" class="w-full bg-blue-600 hover:bg-blue-500 py-4 rounded-2xl font-bold text-lg shadow-lg shadow-blue-500/20 transition-all active:scale-[0.98]">
+                    Start Processing
+                </button>
             </div>
-            <div class="mb-3">
-                <label for="threads" class="form-label">Threads</label>
-                <select class="form-select" id="threads" name="threads">
-                    <option value="1">1</option>
-                    <option value="2">2</option>
-                    <option value="4">4</option>
-                    <option value="8">8</option>
-                </select>
+
+            <div class="space-y-4">
+                <label class="block text-xs font-bold uppercase tracking-wider text-slate-500">Live Status</label>
+                <div id="log_container" class="h-[280px] bg-black/40 border border-slate-800 rounded-2xl p-4 overflow-y-auto custom-scrollbar text-[11px] font-mono space-y-2">
+                    <div class="text-slate-600 italic">Waiting for input...</div>
+                </div>
+                
+                <div id="finish_zone" class="hidden animate-bounce">
+                    <a id="dl_link" href="#" class="block w-full text-center bg-emerald-600 hover:bg-emerald-500 py-3 rounded-xl font-bold shadow-xl shadow-emerald-500/20">
+                        Download ZIP
+                    </a>
+                </div>
             </div>
-            <div class="d-grid">
-                <button type="submit" class="btn btn-primary">Download</button>
-            </div>
-        </form>
+        </div>
     </div>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
-    </body>
-    </html>
-    """)
+
+    <script>
+        const socket = io();
+        const log = document.getElementById('log_container');
+        const btn = document.getElementById('main_btn');
+
+        function startDownload() {
+            const list = document.getElementById('video_list').value;
+            if(!list.trim()) return;
+
+            log.innerHTML = '';
+            btn.disabled = true;
+            btn.innerText = 'Processing...';
+            btn.classList.add('opacity-50');
+            document.getElementById('finish_zone').classList.add('hidden');
+
+            socket.emit('start_download', {
+                video_list: list,
+                format: document.getElementById('format').value,
+                threads: document.getElementById('threads').value
+            });
+        }
+
+        socket.on('status_update', (data) => {
+            const entry = document.createElement('div');
+            entry.className = data.type === 'error' ? 'text-red-400' : (data.type === 'success' ? 'text-emerald-400' : 'text-blue-300');
+            entry.innerText = `> ${data.msg}`;
+            log.appendChild(entry);
+            log.scrollTop = log.scrollHeight;
+        });
+
+        socket.on('download_ready', (data) => {
+            btn.disabled = false;
+            btn.innerText = 'Start Processing';
+            btn.classList.remove('opacity-50');
+            document.getElementById('finish_zone').classList.remove('hidden');
+            document.getElementById('dl_link').href = data.url;
+        });
+    </script>
+</body>
+</html>
+"""
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    # Flask-SocketIO runs its own server wrapper
+    socketio.run(app, debug=True, port=5001)
