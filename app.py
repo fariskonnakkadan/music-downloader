@@ -3,60 +3,65 @@ import zipfile
 import tempfile
 import shutil
 import time
+import re
 from flask import Flask, request, send_file, render_template_string
 from flask_socketio import SocketIO, emit
 from yt_dlp import YoutubeDL
 from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'dev_key_123'
-# Using 'threading' mode to avoid the NotImplementedError on macOS/LibreSSL
+app.config['SECRET_KEY'] = 'progress_tracker_key'
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
-# Store paths to clean up later
 TEMP_STAGING = {}
 
 def update_status(msg, status_type="info"):
-    """Sends real-time updates to the frontend."""
     socketio.emit('status_update', {'msg': msg, 'type': status_type})
 
-def download_item(name, download_dir, video_format):
+def update_progress(current, total):
+    socketio.emit('progress_count', {'current': current, 'total': total})
+
+def safe_filename(title):
+    clean = re.sub(r'[\\/*?:"<>|]', "", title)
+    return clean[:50].strip()
+
+def download_item(name, download_dir, video_format, index_info):
     try:
         update_status(f"🔍 Searching: {name}...")
         
-        # 1. Search Logic
-        search_opts = {
-            'quiet': True, 
-            'default_search': 'ytsearch', 
-            'noplaylist': True, 
-            'skip_download': True
-        }
+        search_opts = {'quiet': True, 'default_search': 'ytsearch', 'noplaylist': True, 'skip_download': True}
         with YoutubeDL(search_opts) as ydl:
             info = ydl.extract_info(name, download=False)
             if not info or 'entries' not in info or not info['entries']:
-                update_status(f"⚠️ Could not find: {name}", "error")
+                update_status(f"❌ Not found: {name}", "error")
                 return None
+            
             video = info['entries'][0]
             url = video['webpage_url']
-            title = video.get('title', 'Unknown Video')
+            raw_title = video.get('title', 'Unknown')
+            artist = video.get('uploader', 'Streamloader')
+            filename = safe_filename(raw_title)
 
-        update_status(f"📥 Downloading: {title[:50]}...")
+        update_status(f"📥 Downloading: {filename}...")
 
-        # 2. Download Logic
         ydl_opts = {
-            'outtmpl': os.path.join(download_dir, '%(title)s.%(ext)s'),
-            'quiet': True,
-            'no_warnings': True,
+            'outtmpl': os.path.join(download_dir, f'{filename}.%(ext)s'),
+            'quiet': True, 'no_warnings': True,
         }
 
         if video_format == "mp3":
             ydl_opts.update({
                 'format': 'bestaudio/best',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192'
-                }],
+                'postprocessors': [
+                    {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'},
+                    {'key': 'FFmpegMetadata', 'add_metadata': True}
+                ],
+                'postprocessor_args': [
+                    '-ar', '44100', '-ac', '2', '-b:a', '192k', '-id3v2_version', '3',
+                    '-metadata', f'title={raw_title}',
+                    '-metadata', f'artist={artist}',
+                    '-metadata', f'album=Streamloader'
+                ],
             })
         else:
             ydl_opts['format'] = 'bestvideo+bestaudio/best'
@@ -64,11 +69,17 @@ def download_item(name, download_dir, video_format):
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         
-        update_status(f"✅ Completed: {title[:40]}...", "success")
-        return title
+        # After successful download, increment counter on frontend
+        index_info['completed'] += 1
+        update_progress(index_info['completed'], index_info['total'])
+        update_status(f"✅ Finished ({index_info['completed']}/{index_info['total']}): {filename}", "success")
+        return filename
 
     except Exception as e:
-        update_status(f"❌ Error processing '{name}': {str(e)}", "error")
+        update_status(f"⚠️ Error: {str(e)}", "error")
+        # Still increment counter even on error to keep total consistent
+        index_info['completed'] += 1
+        update_progress(index_info['completed'], index_info['total'])
         return None
 
 @app.route("/")
@@ -80,34 +91,34 @@ def handle_download(data):
     video_names = [v.strip() for v in data['video_list'].split('\n') if v.strip()]
     video_format = data['format']
     threads = int(data['threads'])
+    
+    total_count = len(video_names)
+    # Using a dictionary to pass by reference to threads
+    index_info = {'completed': 0, 'total': total_count}
 
-    # Create isolated temp environment
     base_temp = tempfile.mkdtemp()
     download_dir = os.path.join(base_temp, "downloads")
     os.makedirs(download_dir, exist_ok=True)
 
-    update_status(f"🚀 Batch started ({len(video_names)} items, {threads} threads)")
+    update_progress(0, total_count)
+    update_status(f"🚀 Batch started: {total_count} items.")
 
     with ThreadPoolExecutor(max_workers=threads) as executor:
-        # We use list() to block until all threads in this batch are done
-        list(executor.map(lambda name: download_item(name, download_dir, video_format), video_names))
+        # Pass the index_info dict to each worker
+        list(executor.map(lambda name: download_item(name, download_dir, video_format, index_info), video_names))
 
-    update_status("📦 Creating ZIP archive...")
-    zip_filename = f"batch_{int(time.time())}.zip"
-    zip_path = os.path.join(base_temp, zip_filename)
-    
+    update_status("📦 Finalizing ZIP...")
+    zip_path = os.path.join(base_temp, f"batch_{int(time.time())}.zip")
     with zipfile.ZipFile(zip_path, "w") as zipf:
         for root, _, files in os.walk(download_dir):
             for file in files:
                 zipf.write(os.path.join(root, file), file)
 
-    # Clean up the raw downloads folder to save space, keep the ZIP
     shutil.rmtree(download_dir)
-    
     sid = request.sid
     TEMP_STAGING[sid] = zip_path
     
-    update_status("✨ All tasks finished!", "success")
+    update_status("✨ Process Complete!", "success")
     emit('download_ready', {'url': f'/fetch/{sid}'})
 
 @app.route("/fetch/<sid>")
@@ -115,93 +126,85 @@ def fetch_zip(sid):
     file_path = TEMP_STAGING.get(sid)
     if file_path and os.path.exists(file_path):
         return send_file(file_path, as_attachment=True)
-    return "Link expired or file not found.", 404
+    return "Expired.", 404
 
-# --- MODERN UI TEMPLATE ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Streamloader UI</title>
+    <title>Streamloader Pro</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
     <style>
-        body { background: #020617; color: #f8fafc; font-family: 'Inter', sans-serif; }
-        .glass { background: rgba(15, 23, 42, 0.8); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.1); }
-        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
-        .custom-scrollbar::-webkit-scrollbar-thumb { background: #334155; border-radius: 10px; }
+        body { background: #020617; color: #f1f5f9; font-family: 'Inter', sans-serif; overflow: hidden; }
+        .glass { background: rgba(15, 23, 42, 0.8); backdrop-filter: blur(14px); border: 1px solid rgba(255,255,255,0.05); }
+        #log::-webkit-scrollbar { height: 6px; width: 4px; }
+        #log::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 10px; }
     </style>
 </head>
-<body class="min-h-screen flex items-center justify-center p-6">
-    <div class="max-w-3xl w-full glass rounded-3xl p-8 shadow-2xl border border-white/5">
-        <header class="mb-8">
-            <h1 class="text-4xl font-black tracking-tight bg-gradient-to-br from-blue-400 to-indigo-600 bg-clip-text text-transparent">
-                Streamloader <span class="text-white/20 font-light">v2.0</span>
-            </h1>
-            <p class="text-slate-400 mt-2">Professional YouTube batch downloader with real-time logging.</p>
-        </header>
-
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-            <div class="md:col-span-2 space-y-5">
-                <div>
-                    <label class="block text-xs font-bold uppercase tracking-wider text-slate-500 mb-2">Video Queue</label>
-                    <textarea id="video_list" rows="6" 
-                        class="w-full bg-slate-950/50 border border-slate-800 rounded-2xl p-4 focus:ring-2 focus:ring-blue-500/50 outline-none transition-all placeholder:text-slate-700" 
-                        placeholder="Paste URLs or video titles here..."></textarea>
-                </div>
-                
-                <div class="flex gap-4">
-                    <div class="flex-1">
-                        <label class="block text-xs font-bold text-slate-500 mb-2">Format</label>
-                        <select id="format" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 outline-none focus:border-blue-500">
-                            <option value="mp3">Audio (MP3)</option>
-                            <option value="mp4">Video (MP4)</option>
-                        </select>
-                    </div>
-                    <div class="flex-1">
-                        <label class="block text-xs font-bold text-slate-500 mb-2">Threads</label>
-                        <select id="threads" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 outline-none focus:border-blue-500">
-                            <option value="1">Single</option>
-                            <option value="4" selected>4 Threads</option>
-                            <option value="8">8 Threads</option>
-                        </select>
-                    </div>
-                </div>
-
-                <button onclick="startDownload()" id="main_btn" class="w-full bg-blue-600 hover:bg-blue-500 py-4 rounded-2xl font-bold text-lg shadow-lg shadow-blue-500/20 transition-all active:scale-[0.98]">
-                    Start Processing
-                </button>
+<body class="h-screen w-screen flex flex-col items-center justify-center p-6">
+    <div class="w-full max-w-5xl h-full flex flex-col space-y-4">
+        
+        <div class="glass rounded-3xl p-6 flex-shrink-0 flex justify-between items-center">
+            <div>
+                <h1 class="text-2xl font-black text-blue-400">Streamloader <span class="text-white opacity-20 italic font-light">Pro</span></h1>
+                <p class="text-[10px] text-slate-500 uppercase tracking-widest font-bold">Metadata + Nokia Legacy Patch v3</p>
             </div>
+            <div id="finish_zone" class="hidden">
+                <a id="dl_link" href="#" class="bg-blue-600 hover:bg-blue-500 px-6 py-2 rounded-xl text-sm font-bold transition-all shadow-lg shadow-blue-500/20 animate-pulse">
+                    Download ZIP
+                </a>
+            </div>
+        </div>
 
-            <div class="space-y-4">
-                <label class="block text-xs font-bold uppercase tracking-wider text-slate-500">Live Status</label>
-                <div id="log_container" class="h-[280px] bg-black/40 border border-slate-800 rounded-2xl p-4 overflow-y-auto custom-scrollbar text-[11px] font-mono space-y-2">
-                    <div class="text-slate-600 italic">Waiting for input...</div>
+        <div class="glass rounded-3xl p-6 flex-1 flex flex-col min-h-0">
+            <div class="flex gap-4 mb-4">
+                <select id="format" class="bg-slate-900 border border-slate-800 rounded-xl px-4 py-2 text-xs font-bold text-slate-400 outline-none">
+                    <option value="mp3">MP3 (Universal)</option>
+                    <option value="mp4">MP4 (Video)</option>
+                </select>
+                <select id="threads" class="bg-slate-900 border border-slate-800 rounded-xl px-4 py-2 text-xs font-bold text-slate-400 outline-none">
+                    <option value="4">4 Threads</option>
+                    <option value="8">8 Threads</option>
+                </select>
+            </div>
+            <textarea id="video_list" class="flex-1 w-full bg-black/30 border border-slate-800/50 rounded-2xl p-5 font-mono text-sm outline-none resize-none transition-all focus:border-blue-500/30" placeholder="One name or link per line..."></textarea>
+            <button onclick="startDownload()" id="main_btn" class="mt-4 w-full bg-blue-600 hover:bg-blue-500 py-4 rounded-2xl font-bold transition-all active:scale-[0.99]">Start Process</button>
+        </div>
+
+        <div class="glass rounded-3xl p-5 flex-shrink-0">
+            <div class="flex justify-between items-end mb-3 px-1">
+                <div class="flex flex-col">
+                    <span class="text-[10px] uppercase font-bold text-slate-500 tracking-widest">Live Output</span>
+                    <span id="counter_text" class="text-xs font-mono text-blue-400">Idle</span>
                 </div>
-                
-                <div id="finish_zone" class="hidden animate-bounce">
-                    <a id="dl_link" href="#" class="block w-full text-center bg-emerald-600 hover:bg-emerald-500 py-3 rounded-xl font-bold shadow-xl shadow-emerald-500/20">
-                        Download ZIP
-                    </a>
+                <div class="w-48 bg-slate-900 h-1 rounded-full overflow-hidden">
+                    <div id="progress_bar" class="bg-blue-500 h-full w-0 transition-all duration-500"></div>
                 </div>
+            </div>
+            <div id="log" class="h-28 bg-black/60 border border-slate-900 rounded-xl p-4 font-mono text-[11px] overflow-y-auto overflow-x-auto whitespace-nowrap space-y-1">
+                <div class="text-slate-700 italic">// Terminal ready for input...</div>
             </div>
         </div>
     </div>
 
     <script>
         const socket = io();
-        const log = document.getElementById('log_container');
+        const log = document.getElementById('log');
         const btn = document.getElementById('main_btn');
+        const counterText = document.getElementById('counter_text');
+        const progressBar = document.getElementById('progress_bar');
 
         function startDownload() {
             const list = document.getElementById('video_list').value;
             if(!list.trim()) return;
-
+            
             log.innerHTML = '';
             btn.disabled = true;
-            btn.innerText = 'Processing...';
             btn.classList.add('opacity-50');
+            counterText.innerText = "Initializing...";
+            progressBar.style.width = "0%";
             document.getElementById('finish_zone').classList.add('hidden');
 
             socket.emit('start_download', {
@@ -211,26 +214,29 @@ HTML_TEMPLATE = """
             });
         }
 
+        socket.on('progress_count', (data) => {
+            const percent = (data.current / data.total) * 100;
+            counterText.innerText = `PROCESSED: ${data.current} / ${data.total} ITEMS`;
+            progressBar.style.width = `${percent}%`;
+        });
+
         socket.on('status_update', (data) => {
             const entry = document.createElement('div');
-            entry.className = data.type === 'error' ? 'text-red-400' : (data.type === 'success' ? 'text-emerald-400' : 'text-blue-300');
-            entry.innerText = `> ${data.msg}`;
+            entry.className = data.type === 'error' ? 'text-red-400' : (data.type === 'success' ? 'text-emerald-400' : 'text-slate-500');
+            entry.innerHTML = `<span class="opacity-30 mr-2">>>></span>${data.msg}`;
             log.appendChild(entry);
             log.scrollTop = log.scrollHeight;
         });
 
         socket.on('download_ready', (data) => {
             btn.disabled = false;
-            btn.innerText = 'Start Processing';
             btn.classList.remove('opacity-50');
             document.getElementById('finish_zone').classList.remove('hidden');
             document.getElementById('dl_link').href = data.url;
         });
     </script>
 </body>
-</html>
-"""
+</html>"""
 
-if __name__ == "__main__":
-    # Flask-SocketIO runs its own server wrapper
-    socketio.run(app, debug=True, port=5001)
+if __name__ == '__main__':
+    socketio.run(app, host='0.0.0.0', port=5001, debug=True)
