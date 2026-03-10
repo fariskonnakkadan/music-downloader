@@ -25,7 +25,7 @@ def safe_filename(title):
     clean = re.sub(r'[\\/*?:"<>|]', "", title)
     return clean[:50].strip()
 
-def download_item(name, download_dir, video_format, index_info):
+def download_item(name, download_dir, video_format, quality, index_info):
     try:
         update_status(f"🔍 Searching: {name}...")
         
@@ -42,7 +42,7 @@ def download_item(name, download_dir, video_format, index_info):
             artist = video.get('uploader', 'Streamloader')
             filename = safe_filename(raw_title)
 
-        update_status(f"📥 Downloading: {filename}...")
+        update_status(f"📥 Downloading: {filename} ({quality})...")
 
         ydl_opts = {
             'outtmpl': os.path.join(download_dir, f'{filename}.%(ext)s'),
@@ -50,34 +50,39 @@ def download_item(name, download_dir, video_format, index_info):
         }
 
         if video_format == "mp3":
+            # Strip 'k' if present in quality string (e.g., '320k' -> '320')
+            bitrate = quality.replace('k', '')
             ydl_opts.update({
                 'format': 'bestaudio/best',
                 'postprocessors': [
-                    {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'},
+                    {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': bitrate},
                     {'key': 'FFmpegMetadata', 'add_metadata': True}
                 ],
                 'postprocessor_args': [
-                    '-ar', '44100', '-ac', '2', '-b:a', '192k', '-id3v2_version', '3',
+                    '-ar', '44100', '-ac', '2', '-b:a', f'{bitrate}k', '-id3v2_version', '3',
                     '-metadata', f'title={raw_title}',
                     '-metadata', f'artist={artist}',
                     '-metadata', f'album=Streamloader'
                 ],
             })
         else:
-            ydl_opts['format'] = 'bestvideo+bestaudio/best'
+            # MP4 Logic: Request best video + best audio merged into mp4
+            # We filter for mp4 extension specifically to avoid mkv wrappers
+            ydl_opts.update({
+                'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                'merge_output_format': 'mp4',
+            })
 
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         
-        # After successful download, increment counter on frontend
         index_info['completed'] += 1
         update_progress(index_info['completed'], index_info['total'])
-        update_status(f"✅ Finished ({index_info['completed']}/{index_info['total']}): {filename}", "success")
+        update_status(f"✅ Finished: {filename}", "success")
         return filename
 
     except Exception as e:
         update_status(f"⚠️ Error: {str(e)}", "error")
-        # Still increment counter even on error to keep total consistent
         index_info['completed'] += 1
         update_progress(index_info['completed'], index_info['total'])
         return None
@@ -90,10 +95,10 @@ def index():
 def handle_download(data):
     video_names = [v.strip() for v in data['video_list'].split('\n') if v.strip()]
     video_format = data['format']
+    quality = data['quality']
     threads = int(data['threads'])
     
     total_count = len(video_names)
-    # Using a dictionary to pass by reference to threads
     index_info = {'completed': 0, 'total': total_count}
 
     base_temp = tempfile.mkdtemp()
@@ -101,11 +106,10 @@ def handle_download(data):
     os.makedirs(download_dir, exist_ok=True)
 
     update_progress(0, total_count)
-    update_status(f"🚀 Batch started: {total_count} items.")
+    update_status(f"🚀 Batch started: {total_count} items at {quality}.")
 
     with ThreadPoolExecutor(max_workers=threads) as executor:
-        # Pass the index_info dict to each worker
-        list(executor.map(lambda name: download_item(name, download_dir, video_format, index_info), video_names))
+        list(executor.map(lambda name: download_item(name, download_dir, video_format, quality, index_info), video_names))
 
     update_status("📦 Finalizing ZIP...")
     zip_path = os.path.join(base_temp, f"batch_{int(time.time())}.zip")
@@ -141,6 +145,7 @@ HTML_TEMPLATE = """
         .glass { background: rgba(15, 23, 42, 0.8); backdrop-filter: blur(14px); border: 1px solid rgba(255,255,255,0.05); }
         #log::-webkit-scrollbar { height: 6px; width: 4px; }
         #log::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 10px; }
+        select { cursor: pointer; }
     </style>
 </head>
 <body class="h-screen w-screen flex flex-col items-center justify-center p-6">
@@ -149,7 +154,7 @@ HTML_TEMPLATE = """
         <div class="glass rounded-3xl p-6 flex-shrink-0 flex justify-between items-center">
             <div>
                 <h1 class="text-2xl font-black text-blue-400">Streamloader <span class="text-white opacity-20 italic font-light">Pro</span></h1>
-                <p class="text-[10px] text-slate-500 uppercase tracking-widest font-bold">Metadata + Nokia Legacy Patch v3</p>
+                <p class="text-[10px] text-slate-500 uppercase tracking-widest font-bold">Metadata + Maximum Bitrate v3.1</p>
             </div>
             <div id="finish_zone" class="hidden">
                 <a id="dl_link" href="#" class="bg-blue-600 hover:bg-blue-500 px-6 py-2 rounded-xl text-sm font-bold transition-all shadow-lg shadow-blue-500/20 animate-pulse">
@@ -159,28 +164,44 @@ HTML_TEMPLATE = """
         </div>
 
         <div class="glass rounded-3xl p-6 flex-1 flex flex-col min-h-0">
-            <div class="flex gap-4 mb-4">
-                <select id="format" class="bg-slate-900 border border-slate-800 rounded-xl px-4 py-2 text-xs font-bold text-slate-400 outline-none">
-                    <option value="mp3">MP3 (Universal)</option>
-                    <option value="mp4">MP4 (Video)</option>
-                </select>
-                <select id="threads" class="bg-slate-900 border border-slate-800 rounded-xl px-4 py-2 text-xs font-bold text-slate-400 outline-none">
-                    <option value="4">4 Threads</option>
-                    <option value="8">8 Threads</option>
-                </select>
+            <div class="flex flex-wrap gap-4 mb-4">
+                <div class="flex flex-col gap-1">
+                    <label class="text-[9px] uppercase font-bold text-slate-500 ml-1">Format</label>
+                    <select id="format" onchange="toggleQuality()" class="bg-slate-900 border border-slate-800 rounded-xl px-4 py-2 text-xs font-bold text-slate-300 outline-none focus:border-blue-500/50">
+                        <option value="mp3">MP3 (Audio Only)</option>
+                        <option value="mp4">MP4 (Video + Audio)</option>
+                    </select>
+                </div>
+                <div class="flex flex-col gap-1" id="quality_container">
+                    <label class="text-[9px] uppercase font-bold text-slate-500 ml-1">Bitrate</label>
+                    <select id="quality" class="bg-slate-900 border border-slate-800 rounded-xl px-4 py-2 text-xs font-bold text-blue-400 outline-none focus:border-blue-500/50">
+                        <option value="320k">320kbps (Extreme)</option>
+                        <option value="256k">256kbps (Very High)</option>
+                        <option value="192k">192kbps (Standard)</option>
+                        <option value="128k">128kbps (Compact)</option>
+                    </select>
+                </div>
+                <div class="flex flex-col gap-1">
+                    <label class="text-[9px] uppercase font-bold text-slate-500 ml-1">Performance</label>
+                    <select id="threads" class="bg-slate-900 border border-slate-800 rounded-xl px-4 py-2 text-xs font-bold text-slate-300 outline-none focus:border-blue-500/50">
+                        <option value="4">4 Threads</option>
+                        <option value="8">8 Threads</option>
+                        <option value="12">12 Threads</option>
+                    </select>
+                </div>
             </div>
             <textarea id="video_list" class="flex-1 w-full bg-black/30 border border-slate-800/50 rounded-2xl p-5 font-mono text-sm outline-none resize-none transition-all focus:border-blue-500/30" placeholder="One name or link per line..."></textarea>
-            <button onclick="startDownload()" id="main_btn" class="mt-4 w-full bg-blue-600 hover:bg-blue-500 py-4 rounded-2xl font-bold transition-all active:scale-[0.99]">Start Process</button>
+            <button onclick="startDownload()" id="main_btn" class="mt-4 w-full bg-blue-600 hover:bg-blue-500 py-4 rounded-2xl font-bold transition-all active:scale-[0.99] shadow-lg shadow-blue-500/10">Start Process</button>
         </div>
 
         <div class="glass rounded-3xl p-5 flex-shrink-0">
             <div class="flex justify-between items-end mb-3 px-1">
                 <div class="flex flex-col">
                     <span class="text-[10px] uppercase font-bold text-slate-500 tracking-widest">Live Output</span>
-                    <span id="counter_text" class="text-xs font-mono text-blue-400">Idle</span>
+                    <span id="counter_text" class="text-xs font-mono text-blue-400">System Ready</span>
                 </div>
-                <div class="w-48 bg-slate-900 h-1 rounded-full overflow-hidden">
-                    <div id="progress_bar" class="bg-blue-500 h-full w-0 transition-all duration-500"></div>
+                <div class="w-48 bg-slate-900 h-1.5 rounded-full overflow-hidden">
+                    <div id="progress_bar" class="bg-blue-500 h-full w-0 transition-all duration-500 shadow-[0_0_10px_rgba(59,130,246,0.5)]"></div>
                 </div>
             </div>
             <div id="log" class="h-28 bg-black/60 border border-slate-900 rounded-xl p-4 font-mono text-[11px] overflow-y-auto overflow-x-auto whitespace-nowrap space-y-1">
@@ -196,6 +217,14 @@ HTML_TEMPLATE = """
         const counterText = document.getElementById('counter_text');
         const progressBar = document.getElementById('progress_bar');
 
+        function toggleQuality() {
+            const format = document.getElementById('format').value;
+            const container = document.getElementById('quality_container');
+            // Quality toggle is only relevant for MP3 transcoding
+            container.style.opacity = format === 'mp4' ? '0.3' : '1';
+            container.style.pointerEvents = format === 'mp4' ? 'none' : 'auto';
+        }
+
         function startDownload() {
             const list = document.getElementById('video_list').value;
             if(!list.trim()) return;
@@ -210,6 +239,7 @@ HTML_TEMPLATE = """
             socket.emit('start_download', {
                 video_list: list,
                 format: document.getElementById('format').value,
+                quality: document.getElementById('quality').value,
                 threads: document.getElementById('threads').value
             });
         }
